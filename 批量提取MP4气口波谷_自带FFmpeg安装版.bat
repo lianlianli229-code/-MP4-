@@ -9,7 +9,7 @@ exit /b %ERRORLEVEL%
 
 # =================================================================================
 # MP4 人声气口（音频波谷）批量提取工具【自带本机 FFmpeg 安全自检与官方安装二合一版】
-# 适用场景：放在你自己的 Windows 电脑上运行（免上传大视频，直接提取波谷与达芬奇标记）
+# 适用场景：放在你自己的 Windows 电脑上运行（免上传大视频，每个 MP4 仅输出唯一标准 _波谷明细.csv）
 # 安全承诺：
 #   1. 若本机已装 FFmpeg：100% 纯本地离线运行（锁定 file/pipe 协议白名单，零联网、零遥测）。
 #   2. 若本机未装 FFmpeg：先完整展示软件安全四要素，必须经你亲手输入 Y 确认后，
@@ -19,11 +19,10 @@ exit /b %ERRORLEVEL%
 # =================================================================================
 
 # ------------------- 【可调参数区（用记事本打开即可修改）】 -------------------
-$NoiseThreshold    = "-35dB"            # 波谷音量阈值：漏检气口可调高为 "-30dB"，误检太多可调低为 "-40dB"
-$MinDuration       = 0.18               # 最短气口持续秒数：低于此秒数的微小停顿将被忽略（建议 0.15 ~ 0.30）
-$BigValleySeconds  = 0.40               # 大气口分界秒数：达到此秒数在达芬奇标记中标为绿色，否则标为青色
-$OutputFolderName  = "气口波谷提取结果" # 汇总输出子文件夹名称
-$TimelineStartHour = 1                  # 达芬奇 EDL 起始小时码：默认新建时间线填 1 (01:00:00:00)；XML时间线(00起)可改为 0
+$NoiseThreshold   = "-35dB"            # 波谷音量阈值：漏检气口可调高为 "-30dB"，误检太多可调低为 "-40dB"
+$MinDuration      = 0.18               # 最短气口持续秒数：低于此秒数的微小停顿将被忽略（建议 0.15 ~ 0.30）
+$BigValleySeconds = 0.40               # 大气口分界秒数：供本机速览区分大气口/小气口
+$OutputFolderName = "气口波谷提取结果" # 输出子文件夹名称（每个 MP4 仅生成 1 份 _波谷明细.csv）
 # ------------------------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
@@ -51,9 +50,6 @@ function Assert-SafeConfig {
     if ([string]::IsNullOrWhiteSpace($OutputFolderName) -or $OutputFolderName -in @(".", "..") -or $OutputFolderName -match '[\\/:\*\?"<>\|]') {
         throw "[配置错误] OutputFolderName 仅允许单层合法文件夹名（禁止包含路径分隔符或 ..），当前值：$OutputFolderName"
     }
-    if (($TimelineStartHour -isnot [int]) -or $TimelineStartHour -lt 0 -or $TimelineStartHour -gt 23) {
-        throw "[配置错误] TimelineStartHour 必须为 0 ~ 23 的整数，当前值：$TimelineStartHour"
-    }
 }
 Assert-SafeConfig
 
@@ -69,7 +65,7 @@ $PinnedBtbnUrl       = "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/
 $PinnedBtbnSha256    = "11B387A88AD24EE6D78BAE7D24A2417834737E6AC00F0A36CA67FEAD1E924EFF"
 
 Write-Host "==================================================================" -ForegroundColor Cyan
-Write-Host "  MP4 音频波谷（人声气口）批量提取工具 [本机自检 + 安全提取版]" -ForegroundColor Cyan
+Write-Host "  MP4 音频波谷（人声气口）批量提取工具 [单一标准 CSV 精简安全版]" -ForegroundColor Cyan
 Write-Host "  当前参数：阈值 = $NoiseThreshold  |  最短气口 = $([string]::Format($InvariantCulture, '{0:0.##}', [double]$MinDuration))s" -ForegroundColor Cyan
 Write-Host "==================================================================" -ForegroundColor Cyan
 
@@ -118,7 +114,6 @@ function Find-ToolPath([string]$exeName) {
     }
     return $null
 }
-
 
 # 辅助核验：解压前静态检查 ZIP 条目，阻断 Zip-Slip 路径穿越
 function Test-SafeZipArchive([string]$archivePath, [string]$destRoot) {
@@ -314,7 +309,7 @@ function Install-FFmpegToLocalUser {
 $ffmpegExe  = Find-ToolPath "ffmpeg.exe"
 $ffprobeExe = Find-ToolPath "ffprobe.exe"
 
-if (-not $ffmpegExe) {
+if (-not $ffmpegExe -or -not $ffprobeExe) {
     $ok = Install-FFmpegToLocalUser
     if (-not $ok) {
         if (-not [Console]::IsInputRedirected) {
@@ -378,7 +373,7 @@ function Get-SafeOutputFile([string]$directory, [string]$baseName, [string]$ext)
     return Join-Path $directory ("${baseName}_${runStamp}${ext}")
 }
 
-# 5. 辅助函数：标准 Win32 CommandLineToArgvW 参数安全转义 & 纯内存执行外部工具
+# 5. 辅助函数：标准 Win32 CommandLineToArgvW 参数安全转义 & CSV 公式注入防护
 function Format-WindowsProcessArg([string]$arg) {
     if ($null -eq $arg -or $arg.Length -eq 0) { return '""' }
     if ($arg -notmatch '[\s"]') { return $arg }
@@ -426,47 +421,117 @@ function Invoke-ProcessInMemory([string]$filePath, [string[]]$argList) {
     }
 }
 
-# 6. 辅助函数：读取视频真实帧率 & 秒数转帧时间码
-function Get-VideoFps([string]$videoPath) {
-    if (-not $ffprobeExe) { return 24.0 }
+# 6. 辅助函数：一次性安全提取源视频完整规格（仅读取数值/枚举条目，不读取自由文本标签防元数据注入）
+function Parse-SafeFrameRate([string]$rateStr) {
+    if ([string]::IsNullOrWhiteSpace($rateStr)) { return $null }
+    $s = $rateStr.Trim()
+    if ($s -match '^(\d+)\s*/\s*(\d+)$') {
+        $num = [double]::Parse($Matches[1], $InvariantCulture)
+        $den = [double]::Parse($Matches[2], $InvariantCulture)
+        if ($den -gt 0.0 -and ($num / $den) -ge 1.0 -and ($num / $den) -le 240.0) {
+            return ($num / $den)
+        }
+    } elseif ($s -match '^\d+(\.\d+)?$') {
+        $val = [double]::Parse($s, $InvariantCulture)
+        if ($val -ge 1.0 -and $val -le 240.0) { return $val }
+    }
+    return $null
+}
+
+function Get-VideoMeta([string]$videoPath) {
+    $meta = [PSCustomObject]@{
+        FpsReal     = 24.0
+        Timebase    = 24
+        IsNtsc      = "FALSE"
+        DurationSec = 0.0
+        TotalFrames = 0
+        Width       = 1080
+        Height      = 1920
+        SampleRate  = 48000
+        Channels    = 2
+        HasAudio    = $true
+    }
+    if (-not $ffprobeExe) { return $meta }
+
     $res = Invoke-ProcessInMemory $ffprobeExe @(
         "-v", "error",
         "-protocol_whitelist", "file,pipe",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=r_frame_rate",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "-show_entries", "format=duration:stream=codec_type,r_frame_rate,avg_frame_rate,width,height,nb_frames,duration,sample_rate,channels",
+        "-of", "json",
         "-i", $videoPath
     )
-    $raw = ($res.StdOut -split "`r?`n" | Where-Object { $_ -match '\d' } | Select-Object -First 1)
-    if ($raw -match '^(\d+)\s*/\s*(\d+)$') {
-        $num = [double]::Parse($Matches[1], $InvariantCulture)
-        $den = [double]::Parse($Matches[2], $InvariantCulture)
-        if ($den -gt 0 -and ($num / $den) -gt 1 -and ($num / $den) -lt 240) {
-            return ($num / $den)
+    if ($res.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($res.StdOut)) { return $meta }
+
+    try {
+        $j = $res.StdOut | ConvertFrom-Json
+        $streams = @($j.streams)
+        $vs = $streams | Where-Object { $_.codec_type -eq "video" } | Select-Object -First 1
+        $as = $streams | Where-Object { $_.codec_type -eq "audio" } | Select-Object -First 1
+
+        if ($null -ne $vs) {
+            $fps = Parse-SafeFrameRate ([string]$vs.r_frame_rate)
+            if ($null -eq $fps) { $fps = Parse-SafeFrameRate ([string]$vs.avg_frame_rate) }
+            if ($null -ne $fps) { $meta.FpsReal = [double]$fps }
+
+            $tb = [int][Math]::Round($meta.FpsReal)
+            if ($tb -le 0) { $tb = 24 }
+            $meta.Timebase = $tb
+            $meta.IsNtsc   = if ([Math]::Abs(($tb * 1000.0 / 1001.0) - $meta.FpsReal) -lt 0.05) { "TRUE" } else { "FALSE" }
+
+            if ("$($vs.width)" -match '^\d+$' -and [int]$vs.width -gt 0)   { $meta.Width  = [int]$vs.width }
+            if ("$($vs.height)" -match '^\d+$' -and [int]$vs.height -gt 0) { $meta.Height = [int]$vs.height }
         }
-    } elseif ($raw -match '^\d+(\.\d+)?$') {
-        return [double]::Parse($raw, $InvariantCulture)
-    }
-    return 24.0
+
+        $dur = 0.0
+        if ($j.format -and $j.format.duration -and [double]::TryParse([string]$j.format.duration, [System.Globalization.NumberStyles]::Float, $InvariantCulture, [ref]$dur) -and $dur -gt 0.0) {
+            $meta.DurationSec = $dur
+        } elseif ($null -ne $vs -and $vs.duration -and [double]::TryParse([string]$vs.duration, [System.Globalization.NumberStyles]::Float, $InvariantCulture, [ref]$dur) -and $dur -gt 0.0) {
+            $meta.DurationSec = $dur
+        }
+
+        $calcFrames = if ($meta.DurationSec -gt 0.0) { [int][Math]::Round($meta.DurationSec * $meta.FpsReal) } else { 0 }
+        if ($null -ne $vs -and ("$($vs.nb_frames)" -match '^\d+$')) {
+            $nb = [int]$vs.nb_frames
+            if ($nb -gt 0) {
+                if ($calcFrames -le 0) {
+                    $calcFrames = $nb
+                    $meta.DurationSec = $nb / $meta.FpsReal
+                } elseif ([Math]::Abs($nb - $calcFrames) -le 2) {
+                    $calcFrames = $nb
+                }
+            }
+        }
+        $meta.TotalFrames = [Math]::Max(0, $calcFrames)
+
+        if ($null -eq $as) {
+            $meta.HasAudio = $false
+        } else {
+            if ("$($as.sample_rate)" -match '^\d+$' -and [int]$as.sample_rate -gt 0) { $meta.SampleRate = [int]$as.sample_rate }
+            if ("$($as.channels)" -match '^\d+$' -and [int]$as.channels -gt 0)       { $meta.Channels   = [int]$as.channels }
+        }
+    } catch {}
+    return $meta
 }
 
-function ConvertTo-Timecode([int]$totalFrames, [int]$timebase, [int]$startHourOffset) {
+# 00:00:00:00 零偏移标准时间码换算（与云端 FCP7 XML 及成品 SRT 五项铁律严格对齐）
+function ConvertTo-ZeroTimecode([int]$totalFrames, [int]$timebase) {
     if ($totalFrames -lt 0) { $totalFrames = 0 }
+    if ($timebase -le 0) { $timebase = 24 }
     $framesPerSec  = $timebase
     $framesPerMin  = $framesPerSec * 60
     $framesPerHour = $framesPerMin * 60
 
-    $hh = [Math]::Floor($totalFrames / $framesPerHour) + $startHourOffset
+    $hh  = [int][Math]::Floor($totalFrames / $framesPerHour)
     $rem = $totalFrames % $framesPerHour
-    $mm = [Math]::Floor($rem / $framesPerMin)
+    $mm  = [int][Math]::Floor($rem / $framesPerMin)
     $rem = $rem % $framesPerMin
-    $ss = [Math]::Floor($rem / $framesPerSec)
-    $ff = $rem % $framesPerSec
+    $ss  = [int][Math]::Floor($rem / $framesPerSec)
+    $ff  = [int]($rem % $framesPerSec)
 
-    return ("{0:D2}:{1:D2}:{2:D2}:{3:D2}" -f [int]$hh, [int]$mm, [int]$ss, [int]$ff)
+    return ("{0:D2}:{1:D2}:{2:D2}:{3:D2}" -f $hh, $mm, $ss, $ff)
 }
 
-# 7. 辅助函数：可选读取同目录同名/同前缀 SRT 字幕分色（含大小限制与正则超时保护）
+# 7. 辅助函数：可选读取同目录同名/同前缀 SRT 字幕辅助标记（含大小限制与正则超时保护）
 function Get-SrtIntervals([string]$dir, [string]$videoBase) {
     $exactSrt = Join-Path $dir ($videoBase + ".srt")
     $srtFile = $null
@@ -480,7 +545,7 @@ function Get-SrtIntervals([string]$dir, [string]$videoBase) {
     if ($null -eq $srtFile) { return $null }
 
     if ($srtFile.Length -gt 20MB) {
-        Write-Host "  [提示] 字幕文件 $($srtFile.Name) 超过 20MB 安全上限，已跳过字幕分色。" -ForegroundColor Yellow
+        Write-Host "  [提示] 字幕文件 $($srtFile.Name) 超过 20MB 安全上限，已跳过本机字幕预分类。" -ForegroundColor Yellow
         return $null
     }
 
@@ -500,16 +565,14 @@ function Get-SrtIntervals([string]$dir, [string]$videoBase) {
     return [PSCustomObject]@{ FileName = $srtFile.Name; Intervals = $subs }
 }
 
-# 8. 逐个扫描 MP4 并输出波谷文件
-$utf8Bom   = New-Object System.Text.UTF8Encoding($true)
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-$summaryRows = New-Object System.Collections.Generic.List[string]
-$summaryRows.Add("视频文件名,视频帧率,波谷序号,起点秒数(s),终点秒数(s),谷底中心秒数(s),持续时长(s),起点时间码,终点时间码,持续帧数,气口分类")
+# 8. 逐个扫描 MP4，每个视频仅输出唯一一份标准 _波谷明细.csv（带 UTF-8 BOM 与 Windows CRLF）
+$utf8Bom = New-Object System.Text.UTF8Encoding($true)
+$csvHeader = "序号,起点秒数(s),终点秒数(s),谷底中心秒数(s),持续时长(s),起点帧号,终点帧号,持续帧数,起点时间码(00起),终点时间码(00起),气口分类,原视频文件名,原片总时长(s),原片总帧数,检测帧率(fps),时间码基准(timebase),NTSC标志,视频分辨率,音频规格"
 
 Write-Host ""
 Write-Host "本机 FFmpeg：$ffmpegExe" -ForegroundColor Gray
 Write-Host "目标文件夹：$targetDir"
-Write-Host "输出文件夹：$outDir"
+Write-Host "输出文件夹：$outDir（单一标准 CSV 模式：1 个视频 = 1 个 _波谷明细.csv）"
 Write-Host "共发现 $($mp4Files.Count) 个 MP4 文件，开始提取波谷..." -ForegroundColor Green
 Write-Host "------------------------------------------------------------------"
 
@@ -519,151 +582,132 @@ foreach ($mp4 in $mp4Files) {
     $baseName = $mp4.BaseName
     Write-Host "[$fileIndex/$($mp4Files.Count)] 正在分析：$($mp4.Name) ..." -ForegroundColor White
 
-    $fpsReal  = Get-VideoFps $mp4.FullName
-    $timebase = [int][Math]::Round($fpsReal)
-    if ($timebase -le 0) { $timebase = 24 }
+    $meta     = Get-VideoMeta $mp4.FullName
+    $fpsReal  = $meta.FpsReal
+    $timebase = $meta.Timebase
 
-    $filterArg = [string]::Format($InvariantCulture, "silencedetect=noise={0}:d={1:0.###}", $NoiseThreshold.Trim(), [double]$MinDuration)
-    # 锁定 file/pipe 协议白名单阻断伪装流媒体外联，并禁用视频/字幕解码器 (-vn -sn -dn) 缩减攻击面与提速
-    $ffRes = Invoke-ProcessInMemory $ffmpegExe @(
-        "-nostdin",
-        "-hide_banner",
-        "-nostats",
-        "-protocol_whitelist", "file,pipe",
-        "-i", $mp4.FullName,
-        "-vn",
-        "-sn",
-        "-dn",
-        "-af", $filterArg,
-        "-f", "null",
-        "-"
-    )
-
-    $logLines = $ffRes.StdErr -split "`r?`n"
-    $rawSilenceLines = New-Object System.Collections.Generic.List[string]
-    $valleys = New-Object System.Collections.Generic.List[object]
-    $pendingStart = $null
-
-    foreach ($line in $logLines) {
-        if ($line -match 'silencedetect') {
-            $rawSilenceLines.Add($line.Trim())
-        }
-        if ($line -match 'silence_start:\s*([0-9\.]+)') {
-            $pendingStart = [double]::Parse($Matches[1], $InvariantCulture)
-        } elseif ($line -match 'silence_end:\s*([0-9\.]+)\s*\|\s*silence_duration:\s*([0-9\.]+)') {
-            $endSec = [double]::Parse($Matches[1], $InvariantCulture)
-            $durSec = [double]::Parse($Matches[2], $InvariantCulture)
-            $startSec = if ($null -ne $pendingStart) { $pendingStart } else { [Math]::Max(0.0, $endSec - $durSec) }
-            $valleys.Add([PSCustomObject]@{
-                StartSec = $startSec
-                EndSec   = $endSec
-                DurSec   = $durSec
-            })
-            $pendingStart = $null
-        }
+    if (-not $meta.HasAudio) {
+        Write-Host "  [警告] 未检测到音频轨（$($mp4.Name)），将仅输出源片规格基准行。" -ForegroundColor Yellow
     }
 
-    if ($ffRes.ExitCode -ne 0 -and $rawSilenceLines.Count -eq 0) {
-        Write-Host "  [警告] FFmpeg 分析此文件音频轨时返回非零退出码（ExitCode=$($ffRes.ExitCode)），请确认视频包含有效音轨。" -ForegroundColor Yellow
+    $valleys = New-Object System.Collections.Generic.List[object]
+    if ($meta.HasAudio) {
+        $filterArg = [string]::Format($InvariantCulture, "silencedetect=noise={0}:d={1:0.###}", $NoiseThreshold.Trim(), [double]$MinDuration)
+        # 锁定 file/pipe 协议白名单阻断伪装流媒体外联，并禁用视频/字幕解码器 (-vn -sn -dn) 缩减攻击面与提速
+        $ffRes = Invoke-ProcessInMemory $ffmpegExe @(
+            "-nostdin",
+            "-hide_banner",
+            "-nostats",
+            "-protocol_whitelist", "file,pipe",
+            "-i", $mp4.FullName,
+            "-vn",
+            "-sn",
+            "-dn",
+            "-af", $filterArg,
+            "-f", "null",
+            "-"
+        )
+
+        $logLines = $ffRes.StdErr -split "`r?`n"
+        $pendingStart = $null
+
+        foreach ($line in $logLines) {
+            if ($line -match 'silence_start:\s*([0-9\.]+)') {
+                $pendingStart = [double]::Parse($Matches[1], $InvariantCulture)
+            } elseif ($line -match 'silence_end:\s*([0-9\.]+)\s*\|\s*silence_duration:\s*([0-9\.]+)') {
+                $endSec = [double]::Parse($Matches[1], $InvariantCulture)
+                $durSec = [double]::Parse($Matches[2], $InvariantCulture)
+                $startSec = if ($null -ne $pendingStart) { $pendingStart } else { [Math]::Max(0.0, $endSec - $durSec) }
+                $valleys.Add([PSCustomObject]@{
+                    StartSec = $startSec
+                    EndSec   = $endSec
+                    DurSec   = $durSec
+                })
+                $pendingStart = $null
+            }
+        }
+
+        # 自动闭合延续至片尾结束仍未输出 silence_end 的尾部静音波谷
+        if ($null -ne $pendingStart -and $meta.DurationSec -gt $pendingStart) {
+            $tailDur = $meta.DurationSec - $pendingStart
+            if ($tailDur -ge ([double]$MinDuration - 0.001)) {
+                $valleys.Add([PSCustomObject]@{
+                    StartSec = $pendingStart
+                    EndSec   = $meta.DurationSec
+                    DurSec   = $tailDur
+                })
+            }
+            $pendingStart = $null
+        }
+
+        if ($ffRes.ExitCode -ne 0 -and $valleys.Count -eq 0) {
+            Write-Host "  [警告] FFmpeg 分析音轨返回非零退出码（ExitCode=$($ffRes.ExitCode)），请检查原视频音轨是否损坏。" -ForegroundColor Yellow
+        }
     }
 
     $srtInfo = Get-SrtIntervals $targetDir $baseName
 
+    $safeVideoCsv = Format-CsvSafeField $mp4.Name
+    $durTotalStr  = [string]::Format($InvariantCulture, "{0:F3}", $meta.DurationSec)
+    $fpsStr       = [string]::Format($InvariantCulture, "{0:0.###}", [Math]::Round($fpsReal, 3))
+    $resStr       = "$($meta.Width)x$($meta.Height)"
+    $audStr       = "$($meta.SampleRate)Hz/$($meta.Channels)ch"
+    $metaSuffix   = "$safeVideoCsv,$durTotalStr,$($meta.TotalFrames),$fpsStr,$timebase,$($meta.IsNtsc),$resStr,$audStr"
+
     $csvLines = New-Object System.Collections.Generic.List[string]
-    $csvLines.Add("序号,起点秒数(s),终点秒数(s),谷底中心秒数(s),持续时长(s),起点帧号,终点帧号,持续帧数,起点时间码,终点时间码,气口分类")
+    $csvLines.Add($csvHeader)
 
-    $safeTitleBase = ($baseName -replace '[\r\n\x00-\x1F]', '_')
-    $edlLines = New-Object System.Collections.Generic.List[string]
-    $edlLines.Add("TITLE: ${safeTitleBase}_气口波谷标记")
-    $edlLines.Add("FCM: NON-DROP FRAME")
-    $edlLines.Add("")
+    if ($valleys.Count -eq 0) {
+        $csvLines.Add("0,0.000,0.000,0.000,0.000,0,0,0,00:00:00:00,00:00:00:00,无检出波谷(仅源片信息),$metaSuffix")
+        Write-Host "  [提示] 本片检出 0 处波谷（若原片环境底噪偏大，可用记事本将脚本顶部 NoiseThreshold 调高为 -30dB 重试；已写入源片规格基准行）。" -ForegroundColor Yellow
+    } else {
+        $vIdx = 0
+        foreach ($v in $valleys) {
+            $vIdx++
+            $midSec     = ($v.StartSec + $v.EndSec) / 2.0
+            $startFrame = [int][Math]::Round($v.StartSec * $fpsReal)
+            $endFrame   = [int][Math]::Round($v.EndSec * $fpsReal)
+            if ($meta.TotalFrames -gt 0 -and $endFrame -gt $meta.TotalFrames) { $endFrame = $meta.TotalFrames }
+            if ($endFrame -le $startFrame) { $endFrame = $startFrame + 1 }
+            $durFrames  = $endFrame - $startFrame
 
-    $vIdx = 0
-    foreach ($v in $valleys) {
-        $vIdx++
-        $midSec     = ($v.StartSec + $v.EndSec) / 2.0
-        $startFrame = [int][Math]::Round($v.StartSec * $fpsReal)
-        $endFrame   = [int][Math]::Round($v.EndSec * $fpsReal)
-        if ($endFrame -le $startFrame) { $endFrame = $startFrame + 1 }
-        $durFrames  = $endFrame - $startFrame
+            $tcIn  = ConvertTo-ZeroTimecode $startFrame $timebase
+            $tcOut = ConvertTo-ZeroTimecode $endFrame   $timebase
 
-        $tcIn  = ConvertTo-Timecode $startFrame $timebase $TimelineStartHour
-        $tcOut = ConvertTo-Timecode $endFrame   $timebase $TimelineStartHour
-
-        $category = ""
-        $edlColor = "ResolveColorCyan"
-        if ($null -ne $srtInfo -and $srtInfo.Intervals.Count -gt 0) {
-            $insideSingleSub = $false
-            foreach ($sub in $srtInfo.Intervals) {
-                if (($v.StartSec -ge ($sub.Start + 0.08)) -and ($v.EndSec -le ($sub.End - 0.08))) {
-                    $insideSingleSub = $true
-                    break
+            $category = ""
+            if ($null -ne $srtInfo -and $srtInfo.Intervals.Count -gt 0) {
+                $insideSingleSub = $false
+                foreach ($sub in $srtInfo.Intervals) {
+                    if (($v.StartSec -ge ($sub.Start + 0.08)) -and ($v.EndSec -le ($sub.End - 0.08))) {
+                        $insideSingleSub = $true
+                        break
+                    }
                 }
-            }
-            if ($insideSingleSub) {
-                $category = "句内停顿(结合SRT)"
-                $edlColor = "ResolveColorYellow"
+                $category = if ($insideSingleSub) { "句内停顿(结合SRT)" } else { "句间真气口(结合SRT)" }
             } else {
-                $category = "句间真气口(结合SRT)"
-                $edlColor = "ResolveColorGreen"
+                $category = if ($v.DurSec -ge $BigValleySeconds) { "大气口" } else { "小气口" }
             }
-        } else {
-            if ($v.DurSec -ge $BigValleySeconds) {
-                $category = "大气口"
-                $edlColor = "ResolveColorGreen"
-            } else {
-                $category = "小气口"
-                $edlColor = "ResolveColorCyan"
-            }
+
+            $sStr = [string]::Format($InvariantCulture, "{0:F3}", $v.StartSec)
+            $eStr = [string]::Format($InvariantCulture, "{0:F3}", $v.EndSec)
+            $mStr = [string]::Format($InvariantCulture, "{0:F3}", $midSec)
+            $dStr = [string]::Format($InvariantCulture, "{0:F3}", $v.DurSec)
+
+            $csvLines.Add("$vIdx,$sStr,$eStr,$mStr,$dStr,$startFrame,$endFrame,$durFrames,$tcIn,$tcOut,$category,$metaSuffix")
         }
-
-        $sStr   = [string]::Format($InvariantCulture, "{0:F3}", $v.StartSec)
-        $eStr   = [string]::Format($InvariantCulture, "{0:F3}", $v.EndSec)
-        $mStr   = [string]::Format($InvariantCulture, "{0:F3}", $midSec)
-        $dStr   = [string]::Format($InvariantCulture, "{0:F3}", $v.DurSec)
-        $fpsStr = [string]::Format($InvariantCulture, "{0:0.##}", [Math]::Round($fpsReal, 2))
-
-        $csvLines.Add("$vIdx,$sStr,$eStr,$mStr,$dStr,$startFrame,$endFrame,$durFrames,$tcIn,$tcOut,$category")
-        $safeVideoCsv = Format-CsvSafeField $mp4.Name
-        $summaryRows.Add("$safeVideoCsv,$fpsStr,$vIdx,$sStr,$eStr,$mStr,$dStr,$tcIn,$tcOut,$durFrames,$category")
-
-        $eventNum = "{0:D3}" -f $vIdx
-        $markerLabel = [string]::Format($InvariantCulture, "气口{0:D3}_{1}_{2:F2}s", $vIdx, $category, $v.DurSec)
-        $edlLines.Add("$eventNum  001      V     C        $tcIn $tcOut $tcIn $tcOut  ")
-        $edlLines.Add(" |C:$edlColor |M:$markerLabel |D:$durFrames")
-        $edlLines.Add("")
     }
 
-    # 写出 1：CSV 明细表（带 UTF-8 BOM，Excel 双击直开不乱码）
+    # 唯一标准输出：CSV 明细表（带 UTF-8 BOM 与显式 CRLF，Excel 双击直开 + 云端 Muse 直读双兼容）
     $csvPath = Get-SafeOutputFile $outDir "${baseName}_波谷明细" ".csv"
-    [System.IO.File]::WriteAllLines($csvPath, $csvLines, $utf8Bom)
+    $csvContent = ($csvLines -join "`r`n") + "`r`n"
+    [System.IO.File]::WriteAllText($csvPath, $csvContent, $utf8Bom)
 
-    # 写出 2：纯净 FFmpeg 波谷原始记录 TXT（头信息包含原视频文件名与帧率，供 Muse 生成 XML 直接读取）
-    $fpsHdrStr = [string]::Format($InvariantCulture, "{0:0.###}", [Math]::Round($fpsReal, 3))
-    $minDurHdr = [string]::Format($InvariantCulture, "{0:0.###}", [double]$MinDuration)
-    $txtHeader = @(
-        "# 视频文件: $($mp4.Name)",
-        "# 检测帧率: $fpsHdrStr fps (时间码基准: ${timebase}fps)",
-        "# 检测参数: 阈值=$NoiseThreshold, 最短时长=${minDurHdr}s",
-        "# 识别波谷总数: $($valleys.Count) 处",
-        "------------------------------------------------------------"
-    )
-    $txtPath = Get-SafeOutputFile $outDir "${baseName}_波谷原始记录" ".txt"
-    [System.IO.File]::WriteAllLines($txtPath, ($txtHeader + $rawSilenceLines), $utf8NoBom)
-
-    # 写出 3：达芬奇时间线区间标记 EDL
-    $edlPath = Get-SafeOutputFile $outDir "${baseName}_达芬奇区间标记" ".edl"
-    [System.IO.File]::WriteAllLines($edlPath, $edlLines, $utf8NoBom)
-
-    $srtTip = if ($null -ne $srtInfo) { "（已自动结合字幕 $($srtInfo.FileName) 分色）" } else { "" }
-    Write-Host "  -> 完成！共提取 $($valleys.Count) 处气口波谷 | 帧率: ${timebase}fps $srtTip" -ForegroundColor Green
+    $srtTip = if ($null -ne $srtInfo) { " | 已结合本机字幕 $($srtInfo.FileName) 预标分类" } else { "" }
+    Write-Host "  -> 完成！输出 $(Split-Path -Leaf $csvPath) | 波谷: $($valleys.Count) 处 | 时长: ${durTotalStr}s ($($meta.TotalFrames)帧) | 帧率: ${fpsStr}fps (NTSC=$($meta.IsNtsc)) | $resStr$srtTip" -ForegroundColor Green
 }
 
-$sumPath = Get-SafeOutputFile $outDir "_全部MP4波谷汇总" ".csv"
-[System.IO.File]::WriteAllLines($sumPath, $summaryRows, $utf8Bom)
-
 Write-Host "------------------------------------------------------------------"
-Write-Host "[全部完成] 共处理 $($mp4Files.Count) 个 MP4 文件！" -ForegroundColor Cyan
+Write-Host "[全部完成] 共处理 $($mp4Files.Count) 个 MP4 文件（已生成 $($mp4Files.Count) 份独立 _波谷明细.csv）！" -ForegroundColor Cyan
 Write-Host "结果已安全保存至：$outDir" -ForegroundColor Cyan
 if (-not [Console]::IsInputRedirected) {
     Write-Host ""
